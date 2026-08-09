@@ -71,6 +71,32 @@ class Config(StrictBaseModel):
                 )
         return self
 
+    @model_validator(mode="after")
+    def validate_conversation_replay_load_type(self) -> "Config":
+        """Validate load.type for conversation_replay and resolve num_conversations.
+
+        concurrent -> closed-loop: num_conversations is the slot count, required.
+        poisson/constant -> open-loop: unset num_conversations auto-sizes to total arrivals.
+        """
+        if self.data.type != DataGenType.ConversationReplay:
+            return self
+        if self.load.type not in (LoadType.POISSON, LoadType.CONSTANT, LoadType.CONCURRENT):
+            raise ValueError(
+                f"data.type 'conversation_replay' requires load.type 'poisson', 'constant', or "
+                f"'concurrent', but got '{self.load.type.value}'. Use 'concurrent' for closed-loop "
+                f"(steady-state) or 'poisson'/'constant' for open-loop (conversations/sec arrivals)."
+            )
+        cr = self.data.conversation_replay
+        if self.load.type == LoadType.CONCURRENT:
+            if cr is not None and cr.num_conversations is None:
+                raise ValueError(
+                    "conversation_replay with load.type 'concurrent' requires "
+                    "conversation_replay.num_conversations (the closed-loop slot count)."
+                )
+        elif cr is not None and cr.num_conversations is None:
+            cr.num_conversations = sum(int(s.rate * s.duration) for s in self.load.stages if isinstance(s, StandardLoadStage))
+        return self
+
 
 def deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
     result = base.copy()

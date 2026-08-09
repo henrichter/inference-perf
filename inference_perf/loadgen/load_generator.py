@@ -16,8 +16,8 @@ from inference_perf.client.server_metrics.base import StageRuntimeInfo, StageSta
 from inference_perf.datagen.base import BaseGenerator
 from inference_perf.utils.trace_reader import AzurePublicDatasetReader
 from inference_perf.utils.request_queue import RequestQueue
-from .load_timer import LoadTimer, ConstantLoadTimer, PoissonLoadTimer, TraceReplayLoadTimer
-from inference_perf.datagen import DataGenerator, SessionGenerator, LazyLoadDataMixin
+from .load_timer import LoadTimer, ArrivalRepeatLoadTimer, ConstantLoadTimer, PoissonLoadTimer, TraceReplayLoadTimer
+from inference_perf.datagen import ConversationReplayDataGenerator, DataGenerator, SessionGenerator, LazyLoadDataMixin
 from inference_perf.apis import InferenceAPIData
 from inference_perf.apis.user_session import LocalUserSession
 from inference_perf.client.modelserver import ModelServerClient
@@ -343,6 +343,16 @@ class LoadGenerator:
         self.base_seed: int = load_config.base_seed
         self._session_cursor: int = 0
 
+        # Tell conversation replay its dispatch mode: closed-loop on concurrent, else open-loop.
+        if isinstance(self.datagen, ConversationReplayDataGenerator):
+            self.datagen.set_closed_loop(self.load_type == LoadType.CONCURRENT)
+
+    @property
+    def _open_loop_conversation_replay(self) -> bool:
+        """Conversation replay driven open-loop (poisson/constant). This mode plans per-arrival
+        turn counts, sizes the run from get_request_count, and prunes the tail at the deadline."""
+        return isinstance(self.datagen, ConversationReplayDataGenerator) and self.load_type != LoadType.CONCURRENT
+
     def _sigint_handler(self, _signum: int, _frame: Optional[FrameType]) -> None:
         """SIGINT handler that sets interrup_sig flag to True"""
         self.interrupt_sig = True
@@ -368,13 +378,21 @@ class LoadGenerator:
 
     def get_timer(self, rate: float, duration: float) -> LoadTimer:
         if self.load_type == LoadType.POISSON:
-            return PoissonLoadTimer(rate=rate, duration=duration)
+            base: LoadTimer = PoissonLoadTimer(rate=rate, duration=duration)
         elif self.load_type == LoadType.TRACE_REPLAY:
             if self.trace is None:
                 raise ValueError("Trace configuration is required for trace replay load generator")
             return TraceReplayLoadTimer(trace_reader=self.trace_reader, trace_file=Path(self.trace.file))
-        # For concurrent and constant load types (rate is adjusted in main.py for concurrent load type)
-        return ConstantLoadTimer(rate=rate, duration=duration)
+        else:
+            # For concurrent and constant load types (rate is adjusted in main.py for concurrent load type)
+            base = ConstantLoadTimer(rate=rate, duration=duration)
+
+        # Open-loop conversation replay repeats each arrival tick once per turn.
+        if self._open_loop_conversation_replay:
+            assert isinstance(self.datagen, ConversationReplayDataGenerator)
+            return ArrivalRepeatLoadTimer(base, self.datagen.arrival_turn_counts())
+
+        return base
 
     async def drain(self, queue: "mp.JoinableQueue[RequestQueueData]") -> None:
         while True:
@@ -764,10 +782,16 @@ class LoadGenerator:
         start_time_epoch = time.time()
         start_time = time.perf_counter() + 1
 
-        if isinstance(self.datagen, DataGenerator) and self.datagen.trace is not None:
+        # Open-loop conversation replay and trace replay size the run from a planned count;
+        # everything else (incl. closed-loop concurrent) uses int(rate*duration).
+        if self._open_loop_conversation_replay or (isinstance(self.datagen, DataGenerator) and self.datagen.trace is not None):
+            assert isinstance(self.datagen, DataGenerator)
             num_requests = self.datagen.get_request_count()
         else:
             num_requests = int(rate * duration)
+
+        # Open-loop prunes the serialized tail at the deadline; closed-loop runs to num_requests.
+        deadline: Optional[float] = start_time + duration if self._open_loop_conversation_replay else None
 
         stage_status = StageStatus.RUNNING
 
@@ -799,7 +823,12 @@ class LoadGenerator:
             stage_task = progress_ctx.add_task(description=f"Stage {stage_id} Requests", total=num_requests)
 
         timed_out = False
+        deadline_reached = False
         while finished_requests_counter.value < num_requests:
+            if deadline is not None and time.perf_counter() >= deadline:
+                logger.info("Stage %d - duration elapsed, pruning remaining turns", stage_id)
+                deadline_reached = True
+                break
             if timeout and start_time + timeout < time.perf_counter():
                 logger.info(f"Loadgen timed out after {timeout:0.2f}s")
                 timed_out = True
@@ -822,8 +851,8 @@ class LoadGenerator:
         if progress_ctx and stage_task:
             progress_ctx.remove_task(stage_task)
 
-        # Trigger cleanup if timed out or received SIGINT
-        if (timed_out or self.interrupt_sig) and cancel_signal:
+        # Trigger cleanup if timed out, hit the duration deadline, or received SIGINT
+        if (timed_out or deadline_reached or self.interrupt_sig) and cancel_signal:
             # Cancel signal must be set before request_phase
             # Allow time for workers to process the signal
             cancel_signal.set()
@@ -832,7 +861,9 @@ class LoadGenerator:
                 await sleep(1)
             request_queue.drain()
             cancel_signal.clear()
-            stage_status = StageStatus.FAILED
+            stage_status = (
+                StageStatus.COMPLETED if deadline_reached and not timed_out and not self.interrupt_sig else StageStatus.FAILED
+            )
         else:
             stage_status = StageStatus.COMPLETED
         # Clear the request_phase event to force worker gather
@@ -1019,6 +1050,8 @@ class LoadGenerator:
         ) as progress:
             overall_task = progress.add_task(description="Overall Progress", total=len(self.stages))
             for stage_id, stage in enumerate(self.stages):
+                if isinstance(self.datagen, DataGenerator):
+                    self.datagen.init_stage(stage)
                 # Handle session-based trace replay
                 if self.load_type == LoadType.TRACE_SESSION_REPLAY and isinstance(stage, TraceSessionReplayLoadStage):
                     await self.run_session_stage(
@@ -1105,6 +1138,11 @@ class LoadGenerator:
             for stage_id, stage in enumerate(self.stages):
                 if not isinstance(stage, StandardLoadStage):
                     raise TypeError(f"Non-multiprocessing run() only supports StandardLoadStage, got {type(stage)}")
+                if not isinstance(self.datagen, DataGenerator):
+                    raise TypeError("Non-multiprocessing run() requires DataGenerator")
+
+                # Prepare per-stage state before building the timer / sizing the stage.
+                self.datagen.init_stage(stage)
 
                 timer = self.get_timer(stage.rate, stage.duration)
                 start_time_epoch = time.time()
@@ -1113,11 +1151,11 @@ class LoadGenerator:
                 stage_status = StageStatus.RUNNING
                 logger.info("Stage %d - run started", stage_id)
 
-                num_requests = int(stage.rate * stage.duration)
+                if self.datagen.trace is not None or isinstance(self.datagen, ConversationReplayDataGenerator):
+                    num_requests = self.datagen.get_request_count()
+                else:
+                    num_requests = int(stage.rate * stage.duration)
                 stage_task = progress.add_task(description=f"Stage {stage_id} Progress", total=num_requests)
-
-                if not isinstance(self.datagen, DataGenerator):
-                    raise TypeError("Non-multiprocessing run() requires DataGenerator")
 
                 async with TaskGroup() as tg:
                     time_generator = timer.start_timer(start_time)

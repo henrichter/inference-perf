@@ -41,6 +41,7 @@ class LocalUserSession:
         system_prompt: str = "",
         tokenizer: Optional[CustomTokenizer] = None,
         max_model_len: Optional[int] = None,
+        base_round: int = 0,
     ):
         self.user_session_id = user_session_id
         self.context = context if context else ""
@@ -49,6 +50,9 @@ class LocalUserSession:
         self.max_model_len = max_model_len
         self.history = []
         self._current_round = 0
+        # First absolute round this session serves; the gate compares round - base so it works
+        # whether the session starts at 0 (open-loop) or a large round_num (closed-loop reset).
+        self._round_base: int = base_round
         self._in_flight: Optional[asyncio.Lock] = None
         self._waiting_rounds: Optional[asyncio.Queue[asyncio.Future[bool]]] = None
 
@@ -73,12 +77,13 @@ class LocalUserSession:
         assert self._waiting_rounds is not None
         assert self._in_flight is not None
 
-        if not self._waiting_rounds.empty() or self._in_flight.locked():
+        # Gate turn K behind turn K-1: hold until round - _round_base reaches _current_round.
+        # Without it, turns sharing one open-loop arrival timestamp dispatch out of order.
+        if round - self._round_base > self._current_round:
             future: asyncio.Future[bool] = asyncio.Future()
             self._waiting_rounds.put_nowait(future)
             await future
         await self._in_flight.acquire()
-        self._current_round += 1
         return self.context
 
     def update_context(self, response: str) -> None:
@@ -117,6 +122,9 @@ class LocalUserSession:
         assert self._waiting_rounds is not None
         assert self._in_flight is not None
 
+        # Advance and wake the next turn, on both success and failure paths so a failed turn
+        # still releases its successor.
+        self._current_round += 1
         if not self._waiting_rounds.empty():
             future = self._waiting_rounds.get_nowait()
             future.set_result(True)

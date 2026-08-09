@@ -97,6 +97,28 @@ class PoissonLoadTimer(LoadTimer):
                 yield next_time
 
 
+class ArrivalRepeatLoadTimer(LoadTimer):
+    """Repeats each base-timer tick once per turn of that arrival (open-loop conversation).
+
+    The base timer ticks once per arriving conversation, but the load generator enqueues one
+    item per turn, so every turn of an arrival is scheduled at that arrival's time. Turns after
+    the first share the tick harmlessly — the session's round gate holds them behind turn 0.
+
+    ``turn_counts`` is the number of turns per arrival, in arrival order.
+    """
+
+    def __init__(self, base_timer: LoadTimer, turn_counts: list[int]) -> None:
+        self._base_timer = base_timer
+        self._turn_counts = turn_counts
+
+    def start_timer(self, initial: Optional[float] = None) -> Generator[float, None, None]:
+        base = self._base_timer.start_timer(initial)
+        for count in self._turn_counts:
+            tick = next(base)
+            for _ in range(count):
+                yield tick
+
+
 class TraceReplayLoadTimer(LoadTimer):
     def __init__(self, trace_reader: TraceReader, trace_file: Path) -> None:
         self._trace_reader = trace_reader

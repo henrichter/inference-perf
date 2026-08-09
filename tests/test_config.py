@@ -443,3 +443,94 @@ def test_multimodal_config_parsing() -> None:
     finally:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
+
+
+def test_conversation_replay_requires_rate_load_type() -> None:
+    import pytest
+
+    # conversation_replay supports concurrent/poisson/constant; a session load type is
+    # rejected with a clear message.
+    with pytest.raises(ValueError, match="requires load.type 'poisson', 'constant', or 'concurrent'"):
+        Config.model_validate(
+            {
+                "data": {
+                    "type": "conversation_replay",
+                    "conversation_replay": {"num_conversations": 2},
+                },
+                "load": {
+                    "type": "trace_session_replay",
+                    "stages": [{"concurrent_sessions": 4}],
+                },
+            }
+        )
+
+
+def test_conversation_replay_accepts_concurrent_closed_loop() -> None:
+    # Closed-loop: concurrent load with an explicit num_conversations (slot count).
+    cfg = Config.model_validate(
+        {
+            "data": {"type": "conversation_replay", "conversation_replay": {"num_conversations": 4}},
+            "load": {"type": "concurrent", "stages": [{"num_requests": 40, "concurrency_level": 4}]},
+        }
+    )
+    assert cfg.load.type.value == "concurrent"
+    assert cfg.data.conversation_replay is not None
+    assert cfg.data.conversation_replay.num_conversations == 4
+
+
+def test_conversation_replay_concurrent_requires_num_conversations() -> None:
+    import pytest
+
+    # Closed-loop has no rate*duration to auto-size from, so num_conversations is required.
+    with pytest.raises(ValueError, match="load.type 'concurrent' requires"):
+        Config.model_validate(
+            {
+                "data": {"type": "conversation_replay", "conversation_replay": {"seed": 1}},
+                "load": {"type": "concurrent", "stages": [{"num_requests": 40, "concurrency_level": 4}]},
+            }
+        )
+
+
+def test_conversation_replay_accepts_poisson_and_constant() -> None:
+    for load_type in ("poisson", "constant"):
+        cfg = Config.model_validate(
+            {
+                "data": {
+                    "type": "conversation_replay",
+                    "conversation_replay": {"num_conversations": 2},
+                },
+                "load": {
+                    "type": load_type,
+                    "stages": [{"rate": 2, "duration": 5}],
+                },
+            }
+        )
+        assert cfg.load.type.value == load_type
+        assert cfg.data.type.value == "conversation_replay"
+
+
+def test_conversation_replay_auto_sizes_num_conversations_when_unset() -> None:
+    # Unset num_conversations is resolved by the validator to the total arrivals
+    # (sum of rate*duration across stages) so every conversation is unique.
+    cfg = Config.model_validate(
+        {
+            "data": {"type": "conversation_replay", "conversation_replay": {"seed": 1}},
+            "load": {
+                "type": "poisson",
+                "stages": [{"rate": 2.0, "duration": 300}, {"rate": 5.0, "duration": 100}],
+            },
+        }
+    )
+    assert cfg.data.conversation_replay is not None
+    assert cfg.data.conversation_replay.num_conversations == 2 * 300 + 5 * 100  # 1100
+
+
+def test_conversation_replay_explicit_num_conversations_preserved() -> None:
+    cfg = Config.model_validate(
+        {
+            "data": {"type": "conversation_replay", "conversation_replay": {"num_conversations": 42}},
+            "load": {"type": "constant", "stages": [{"rate": 2.0, "duration": 10}]},
+        }
+    )
+    assert cfg.data.conversation_replay is not None
+    assert cfg.data.conversation_replay.num_conversations == 42

@@ -137,7 +137,7 @@ def test_itl_not_inflated_by_per_chunk_bos() -> None:
     # Build a one-token-per-chunk stream by decoding each real token id back to text.
     text = "The quick brown fox jumps over the lazy dog"
     ids = hf.encode(text, add_special_tokens=False)
-    chunk_texts = [hf.decode([i]) for i in ids]
+    chunk_texts = [str(hf.decode([i])) for i in ids]
     n = len(ids)
 
     # Sanity: with the BOS the per-chunk sum is inflated by exactly one token per

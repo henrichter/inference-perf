@@ -13,7 +13,7 @@
 # limitations under the License.
 from inference_perf.apis import InferenceAPIData, LazyLoadInferenceAPIData
 from inference_perf.utils.custom_tokenizer import CustomTokenizer
-from inference_perf.config import APIConfig, APIType, DataConfig, Distribution, SharedPrefix, TraceConfig
+from inference_perf.config import APIConfig, APIType, DataConfig, Distribution, LoadStage, SharedPrefix, TraceConfig
 from abc import ABC, abstractmethod
 from typing import Generator, Optional, List, Dict, Any
 
@@ -112,6 +112,13 @@ class DataGenerator(BaseGenerator):
         by the trace. Subclasses that drive load from a trace must override.
         """
         raise NotImplementedError
+
+    def init_stage(self, stage: LoadStage) -> None:
+        """Prepare per-stage state before a stage is dispatched, called once per stage by the
+        load generator. No-op by default; override when the request stream depends on the stage
+        (e.g. open-loop conversation arrival reads the StandardLoadStage rate/duration).
+        """
+        pass
 
 
 class SessionGenerator(BaseGenerator):

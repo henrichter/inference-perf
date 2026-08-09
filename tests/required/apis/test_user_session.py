@@ -266,8 +266,9 @@ class TestUserSessionTruncation:
 
         session.history = ["tok_5", "tok_5"]
         session.context = "tok_5 tok_5 tok_5"
+        session._current_round = 2  # two prior turns completed; this is turn 2
 
-        data = UserSessionCompletionAPIData(user_session_id="sess_1", target_round=1, prompt="tok_10", max_tokens=0)
+        data = UserSessionCompletionAPIData(user_session_id="sess_1", target_round=2, prompt="tok_10", max_tokens=0)
 
         payload = await data.to_request_body("model", 0, False, False)
 
