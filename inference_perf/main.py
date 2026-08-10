@@ -44,6 +44,7 @@ from inference_perf.datagen import (
     OTelTraceReplayDataGenerator,
     WekaTraceReplayDataGenerator,
     ConversationReplayDataGenerator,
+    ConversationSessionGenerator,
     VisionArenaDataGenerator,
 )
 from inference_perf.client.modelserver import (
@@ -263,14 +264,21 @@ def main_cli() -> None:
     if len(config.load.stages) == 0 and config.load.sweep is None:
         raise Exception("Load stages must be configured, or sweep must be configured")
 
+    is_session_replay = bool(
+        config.data
+        and (
+            config.data.type in (DataGenType.OTelTraceReplay, DataGenType.WekaTraceReplay)
+            or (
+                config.data.type == DataGenType.ConversationReplay
+                and config.load.type == LoadType.TRACE_SESSION_REPLAY
+            )
+        )
+    )
+
     # Create multiprocessing manager for session replay datagens if needed.
     # Must be created before workers are forked.
     mp_manager = None
-    if (
-        config.data
-        and config.data.type in (DataGenType.OTelTraceReplay, DataGenType.WekaTraceReplay)
-        and config.load.num_workers > 0
-    ):
+    if is_session_replay and config.load.num_workers > 0:
         mp_manager = mp.Manager()
 
     datagen: BaseGenerator
@@ -347,7 +355,18 @@ def main_cli() -> None:
             datagen = RandomDataGenerator(config.api, config.data, tokenizer, seed=config.load.base_seed)
         elif config.data.type == DataGenType.SharedPrefix:
             datagen = SharedPrefixDataGenerator(config.api, config.data, tokenizer)
+        elif config.data.type == DataGenType.ConversationReplay and is_session_replay:
+            # Open-loop: run_session_stage records per-session lifecycle metrics.
+            datagen = ConversationSessionGenerator(
+                config.api,
+                config.data,
+                tokenizer,
+                mp_manager,
+                config.load.base_seed,
+                num_workers=config.load.num_workers,
+            )
         elif config.data.type == DataGenType.ConversationReplay:
+            # Closed-loop (concurrent) path: per-turn DataGenerator.
             datagen = ConversationReplayDataGenerator(config.api, config.data, tokenizer)
         elif config.data.type == DataGenType.InfinityInstruct:
             datagen = InfinityInstructDataGenerator(config.api, config.data, tokenizer)
@@ -370,7 +389,7 @@ def main_cli() -> None:
 
     # Create session metrics collector only for session-replay workflows
     session_metrics_collector = None
-    if config.data and config.data.type in (DataGenType.OTelTraceReplay, DataGenType.WekaTraceReplay):
+    if is_session_replay:
         session_metrics_collector = SessionMetricsCollector()
 
     # Define LoadGenerator with session metrics collector

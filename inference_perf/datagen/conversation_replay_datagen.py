@@ -40,7 +40,8 @@ import asyncio
 import hashlib
 import logging
 from dataclasses import dataclass, field
-from typing import Generator, List, Optional
+from multiprocessing.managers import SyncManager
+from typing import Any, Dict, Generator, List, Optional
 
 import numpy as np
 
@@ -55,6 +56,16 @@ from inference_perf.config import (
     ConversationReplayConfig,
     DataConfig,
     Distribution,
+)
+from inference_perf.datagen.replay_graph_session_datagen import (
+    ReplayGraphSessionGeneratorBase,
+    ReplaySession,
+)
+from inference_perf.datagen.replay_graph_types import (
+    GraphCall,
+    GraphEvent,
+    InputSegment,
+    ReplayGraph,
 )
 from inference_perf.utils.custom_tokenizer import CustomTokenizer
 from inference_perf.utils.numeric.distribution import sample_from_distribution
@@ -130,33 +141,106 @@ class ConversationBlueprint:
     system_prompt_tokens: int
     dynamic_system_prompt: str = ""
     turn_prompts: List[str] = field(default_factory=list)
+    turn_input_lens: List[int] = field(default_factory=list)
     turn_output_lens: List[int] = field(default_factory=list)
     turn_tool_call_latencies: List[float] = field(default_factory=list)
+    # Per-turn cumulative input token count (system + all prior turns + this user
+    # turn), resolved at build time from the ignore_eos-pinned lengths. Lets
+    # _blueprint_to_graph assemble the growing-prefix graph with no tokenizer calls.
+    turn_total_input_tokens: List[int] = field(default_factory=list)
 
 
-class ConversationReplayDataGenerator(DataGenerator, LazyLoadDataMixin):
-    """Generates synthetic multi-turn conversations from distribution configs.
+class _ConversationBlueprintBuilder:
+    """Shared synthetic-conversation blueprint generation.
 
-    Each conversation has:
-    - A two-part system prompt (shared prefix + dynamic per-conversation suffix)
-    - N turns with independently sampled input/output token lengths
-    - Sequential turn enforcement via LocalUserSession
-
-    Conversations are dispatched round-robin across workers using
-    preferred_worker_id for affinity. When all turns of a conversation are
-    exhausted, the session resets and replays from the beginning (recycling).
+    Owns the deterministic content generation (system prompts, per-turn prompts,
+    output lengths, tool-call latencies) common to the closed-loop
+    ``ConversationReplayDataGenerator`` (a ``DataGenerator``) and the open-loop
+    ``ConversationSessionGenerator`` (a ``SessionGenerator``). Subclasses call
+    ``_init_generation`` from ``__init__`` after ``super().__init__`` has set
+    ``self.tokenizer``, then ``_build_conversations``. Nothing here has any
+    dispatch- or session-lifecycle dependency, so both generators build identical
+    blueprints from the same config + seed.
     """
 
-    def __init__(
-        self,
-        api_config: APIConfig,
-        config: DataConfig,
-        tokenizer: Optional[CustomTokenizer],
-    ) -> None:
-        super().__init__(api_config, config, tokenizer)
+    tokenizer: Optional[CustomTokenizer]
 
+    # Headroom reserved below max_model_len for a single request (input + output),
+    # matching the closed-loop LocalUserSession path (see user_session.py:148) so both
+    # generators agree on what "fits" the backend context window.
+    _CONTEXT_SAFETY_BUFFER = 200
+
+    @property
+    def _context_budget(self) -> int:
+        """Total tokens (input + output) a single request may occupy."""
+        return self.max_model_len - self._CONTEXT_SAFETY_BUFFER
+
+    def _plan_within_budget(
+        self, sys_tokens: int, input_lens: List[int], output_lens: List[int]
+    ) -> tuple[int, List[int], List[int], List[int]]:
+        """Bound a conversation to the context window entirely by arithmetic.
+
+        Because the run uses ``ignore_eos``, each turn's output length is pinned to
+        ``output_lens[k]``, so the whole growing prefix is known up front:
+
+            total_input(0) = eff_sys + u_0
+            total_input(k) = total_input(k-1) + eff_out(k-1) + u_k   (k > 0)
+
+        and every request must satisfy ``total_input(k) + eff_out(k) <= budget``.
+        We resolve the *effective* lengths here, before any text is generated, so
+        content that would not fit is never sampled or materialised. Two clamps and
+        one stop (mirroring the agreed overflow model):
+
+        * Turn 0 system clamp: ``eff_sys = min(sys, budget - u_0 - out_0)`` (floor 0);
+          if ``u_0 + out_0`` alone still overflows, clamp ``out_0`` too.
+        * Turn k>0 input-overflow: if ``total_input(k) >= budget`` the prefix leaves
+          no room for output -> stop; the conversation ends at turn k-1.
+        * Turn k output-overflow: if ``total_input(k) + out_k > budget`` clamp
+          ``out_k = budget - total_input(k)`` and keep the turn.
+
+        Returns ``(eff_sys_tokens, eff_input_lens, eff_output_lens, per_turn_total_input)``
+        where the three per-turn lists are truncated to the effective turn count.
+        """
+        budget = self._context_budget
+        n = len(input_lens)
+        eff_inputs: List[int] = []
+        eff_outputs: List[int] = []
+        totals: List[int] = []
+
+        # Turn 0 must fit; the user turn is the genuinely new content and is kept, so
+        # the system prompt absorbs the clamp first, then out_0 if still needed.
+        u0 = input_lens[0] if n > 0 else 0
+        out0 = output_lens[0] if n > 0 else 0
+        eff_sys = max(0, min(sys_tokens, budget - u0 - out0))
+        if u0 + out0 > budget:
+            out0 = max(1, budget - u0)
+
+        prev_total = 0
+        for k in range(n):
+            u_k = input_lens[k]
+            if k == 0:
+                total_input = eff_sys + u_k
+                out_k = out0
+            else:
+                total_input = prev_total + eff_outputs[k - 1] + u_k
+                # Input-overflow: no room for even one output token -> stop here.
+                if total_input >= budget:
+                    break
+                out_k = output_lens[k]
+                # Output-overflow: clamp to remaining room, keep the turn.
+                if total_input + out_k > budget:
+                    out_k = budget - total_input
+
+            eff_inputs.append(u_k)
+            eff_outputs.append(out_k)
+            totals.append(total_input)
+            prev_total = total_input
+
+        return eff_sys, eff_inputs, eff_outputs, totals
+
+    def _init_generation(self, config: DataConfig) -> None:
         if self.tokenizer is None:
-            raise ValueError("Tokenizer is required for ConversationReplayDataGenerator.")
+            raise ValueError("Tokenizer is required for conversation replay.")
 
         cr_config = config.conversation_replay
         if cr_config is None:
@@ -185,10 +269,189 @@ class ConversationReplayDataGenerator(DataGenerator, LazyLoadDataMixin):
         self._current_stage_id: Optional[int] = None
         self._current_shared_prompt: Optional[str] = None
 
-        # Build conversation blueprints
         self.blueprints: List[ConversationBlueprint] = []
+
+    def _get_or_generate_shared_prompt(self, stage_id: int) -> str:
+        """Get or generate the shared system prompt prefix for a specific stage using a derived stable seed."""
+        if self._current_shared_prompt is None or self._current_stage_id != stage_id:
+            if stage_id == 0:
+                # Stage 0 draws from the shared global self.rng at startup. This is
+                # deterministic within a run (seed -> identical blueprints in one
+                # build, and identical across the closed-loop and open-loop
+                # generators that share this builder). Cross-version seed stability is
+                # not a goal, so the exact draw sequence may change between versions.
+                self._current_shared_prompt = self._generate_random_token_text(self.cr_config.shared_system_prompt_len)
+            else:
+                # Later stages derive their seed stably from the base seed and stage ID.
+                # This happens dynamically at runtime (post-setup) and uses local isolated RNGs.
+                seed_str = f"{self.cr_config.seed}_stage_{stage_id}"
+                hash_digest = hashlib.sha256(seed_str.encode("utf-8")).digest()
+                derived_seed = int.from_bytes(hash_digest[:4], byteorder="little")
+                local_rng = np.random.default_rng(derived_seed)
+
+                self._current_shared_prompt = self._generate_random_token_text(
+                    self.cr_config.shared_system_prompt_len, rng=local_rng
+                )
+            self._current_stage_id = stage_id
+        return self._current_shared_prompt
+
+    def _build_system_prompt(self, shared_prompt: str, dynamic_prompt: str) -> str:
+        """Combine shared prompt prefix and dynamic prompt suffix with a space."""
+        return f"{shared_prompt} {dynamic_prompt}" if dynamic_prompt else shared_prompt
+
+    def _sample_distribution(self, dist: Distribution, count: int) -> List[int]:
+        """Sample ``count`` values from a Distribution."""
+        arr = sample_from_distribution(dist, count, rng=self.rng)
+        return [int(v) for v in arr]
+
+    def _generate_random_token_text(self, num_tokens: int, rng: Optional[np.random.Generator] = None) -> str:
+        """Generate random text that is approximately ``num_tokens`` long."""
+        if num_tokens <= 0:
+            return ""
+        assert self.tokenizer is not None
+        hf_tokenizer = self.tokenizer.get_tokenizer()
+        use_rng = rng if rng is not None else self.rng
+        token_ids = use_rng.integers(0, self.vocab_size, size=num_tokens).tolist()
+        return str(hf_tokenizer.decode(token_ids, skip_special_tokens=True))
+
+    def _build_conversations(self) -> None:
+        """Pre-generate all conversation blueprints deterministically."""
+        cfg = self.cr_config
+        assert cfg.num_conversations is not None, "num_conversations must be resolved before build"
+        n = cfg.num_conversations
+
+        # Sample per-conversation parameters
+        if cfg.turns_per_conversation is not None:
+            turn_counts = self._sample_distribution(cfg.turns_per_conversation, n)
+        else:
+            turn_counts = [10] * n  # default fallback
+
+        if cfg.dynamic_system_prompt_len is not None:
+            dynamic_lens = self._sample_distribution(cfg.dynamic_system_prompt_len, n)
+        else:
+            dynamic_lens = [0] * n
+
+        # Generate shared system prompt once (for stage 0)
+        shared_prompt_text = self._get_or_generate_shared_prompt(0)
+
+        total_turns = sum(turn_counts)
+        logger.info(
+            "Building %d conversations (%d total turns, shared prompt %d tokens)",
+            n,
+            total_turns,
+            cfg.shared_system_prompt_len,
+        )
+
+        # Sample all turn-level parameters at once for efficiency
+        if cfg.input_tokens_per_turn is not None:
+            all_input_lens = self._sample_distribution(cfg.input_tokens_per_turn, total_turns)
+        else:
+            all_input_lens = [512] * total_turns
+
+        if cfg.output_tokens_per_turn is not None:
+            all_output_lens = self._sample_distribution(cfg.output_tokens_per_turn, total_turns)
+        else:
+            all_output_lens = [256] * total_turns
+
+        if cfg.tool_call_latency_sec is not None:
+            # Sample latencies as floats (seconds); re-use the same distribution
+            # machinery but convert from the integer output to float seconds.
+            all_tool_latencies: List[float] = [
+                float(v) for v in self._sample_distribution(cfg.tool_call_latency_sec, total_turns)
+            ]
+        else:
+            all_tool_latencies = []
+
+        # Build each conversation. Lengths are resolved to fit the context window by
+        # arithmetic FIRST (ignore_eos pins outputs, so the whole growing prefix is
+        # known), then text is generated only at those effective lengths -- content
+        # that would not fit is never sampled, decoded, or retained.
+        turn_offset = 0
+        shared_len = cfg.shared_system_prompt_len
+        for conv_id in range(n):
+            num_turns = turn_counts[conv_id]
+
+            sampled_input_lens = all_input_lens[turn_offset : turn_offset + num_turns]
+            sampled_output_lens = all_output_lens[turn_offset : turn_offset + num_turns]
+            turn_tool_latencies = all_tool_latencies[turn_offset : turn_offset + num_turns] if all_tool_latencies else []
+            turn_offset += num_turns
+
+            sampled_sys = shared_len + dynamic_lens[conv_id]
+            eff_sys, eff_input_lens, eff_output_lens, turn_totals = self._plan_within_budget(
+                sampled_sys, list(sampled_input_lens), list(sampled_output_lens)
+            )
+            eff_num_turns = len(eff_input_lens)
+            turn_tool_latencies = turn_tool_latencies[:eff_num_turns]
+
+            # Split the effective system budget across the fixed shared prefix and the
+            # per-conversation dynamic suffix. The dynamic part absorbs the clamp first
+            # (keeping the shared prefix byte-identical across conversations for prefix
+            # cache hits); only when eff_sys < shared_len do we shorten the shared text
+            # for this conversation.
+            eff_shared_len = min(shared_len, eff_sys)
+            eff_dynamic_len = max(0, eff_sys - shared_len)
+            shared_text_for_conv = (
+                shared_prompt_text
+                if eff_shared_len == shared_len
+                else self._generate_random_token_text(eff_shared_len)
+            )
+            dynamic_text = self._generate_random_token_text(eff_dynamic_len)
+            system_prompt = self._build_system_prompt(shared_text_for_conv, dynamic_text)
+
+            # Generate turn prompts at their effective (unclamped) input lengths.
+            turn_prompts: List[str] = [self._generate_random_token_text(tlen) for tlen in eff_input_lens]
+
+            bp = ConversationBlueprint(
+                conversation_id=conv_id,
+                num_turns=eff_num_turns,
+                system_prompt=system_prompt,
+                system_prompt_tokens=eff_sys,
+                dynamic_system_prompt=dynamic_text,
+                turn_prompts=turn_prompts,
+                turn_input_lens=eff_input_lens,
+                turn_output_lens=eff_output_lens,
+                turn_tool_call_latencies=turn_tool_latencies,
+                turn_total_input_tokens=turn_totals,
+            )
+            self.blueprints.append(bp)
+
+
+class ConversationReplayDataGenerator(DataGenerator, LazyLoadDataMixin, _ConversationBlueprintBuilder):
+    """Generates synthetic multi-turn conversations from distribution configs.
+
+    Each conversation has:
+    - A two-part system prompt (shared prefix + dynamic per-conversation suffix)
+    - N turns with independently sampled input/output token lengths
+    - Sequential turn enforcement via LocalUserSession
+
+    Conversations are dispatched round-robin across workers using
+    preferred_worker_id for affinity. When all turns of a conversation are
+    exhausted, the session resets and replays from the beginning (recycling).
+    """
+
+    def __init__(
+        self,
+        api_config: APIConfig,
+        config: DataConfig,
+        tokenizer: Optional[CustomTokenizer],
+    ) -> None:
+        super().__init__(api_config, config, tokenizer)
+        self._init_generation(config)
+
+        # Build conversation blueprints, then one LocalUserSession per slot. Session
+        # creation is a separate loop (not interleaved into _build_conversations) so the
+        # shared builder stays dispatch-agnostic; LocalUserSession.__init__ consumes no
+        # RNG, so blueprint generation is byte-identical to the interleaved form.
         self.user_sessions: List[LocalUserSession] = []
         self._build_conversations()
+        for bp in self.blueprints:
+            self.user_sessions.append(
+                self._new_session(
+                    user_session_id=f"conv_{bp.conversation_id}",
+                    context=bp.system_prompt,
+                    system_prompt=bp.system_prompt,
+                )
+            )
 
         logger.info(
             "ConversationReplayDataGenerator: %d conversations, %d total turns",
@@ -282,131 +545,213 @@ class ConversationReplayDataGenerator(DataGenerator, LazyLoadDataMixin):
         LocalUserSession._instances[user_session_id] = session
         return session
 
-    def _get_or_generate_shared_prompt(self, stage_id: int) -> str:
-        """Get or generate the shared system prompt prefix for a specific stage using a derived stable seed."""
-        if self._current_shared_prompt is None or self._current_stage_id != stage_id:
-            if stage_id == 0:
-                # BACKWARDS COMPATIBILITY: Stage 0 must use the shared global self.rng
-                # to maintain the exact sequence of calls at startup, ensuring existing
-                # benchmark seeds generate identical conversation blueprints.
-                self._current_shared_prompt = self._generate_random_token_text(self.cr_config.shared_system_prompt_len)
-            else:
-                # Later stages derive their seed stably from the base seed and stage ID.
-                # This happens dynamically at runtime (post-setup) and uses local isolated RNGs.
-                seed_str = f"{self.cr_config.seed}_stage_{stage_id}"
-                hash_digest = hashlib.sha256(seed_str.encode("utf-8")).digest()
-                derived_seed = int.from_bytes(hash_digest[:4], byteorder="little")
-                local_rng = np.random.default_rng(derived_seed)
 
-                self._current_shared_prompt = self._generate_random_token_text(
-                    self.cr_config.shared_system_prompt_len, rng=local_rng
-                )
-            self._current_stage_id = stage_id
-        return self._current_shared_prompt
+class ConversationSessionGenerator(ReplayGraphSessionGeneratorBase, _ConversationBlueprintBuilder):
+    """Open-loop synthetic multi-turn conversations as graph-backed sessions.
 
-    def _build_system_prompt(self, shared_prompt: str, dynamic_prompt: str) -> str:
-        """Combine shared prompt prefix and dynamic prompt suffix with a space."""
-        return f"{shared_prompt} {dynamic_prompt}" if dynamic_prompt else shared_prompt
+    Shares blueprint generation with ``ConversationReplayDataGenerator`` (via
+    ``_ConversationBlueprintBuilder``) so content is identical for a given config +
+    seed, but dispatches through the session runtime instead of per-turn requests.
 
-    def _sample_distribution(self, dist: Distribution, count: int) -> List[int]:
-        """Sample ``count`` values from a Distribution."""
-        arr = sample_from_distribution(dist, count, rng=self.rng)
-        return [int(v) for v in arr]
+    Each conversation maps onto a linear ``ReplayGraph`` (turn k = one
+    ``GraphEvent`` whose sole predecessor is turn k-1). Subclasses the graph session
+    runtime, which supplies the whole ``SessionGenerator`` contract (session pool
+    dispatch, worker affinity, lazy materialization, cross-process completion
+    tracking, ``SessionLifecycleMetric`` recording). The only hook we implement is
+    ``_build_session``.
 
-    def _generate_random_token_text(self, num_tokens: int, rng: Optional[np.random.Generator] = None) -> str:
-        """Generate random text that is approximately ``num_tokens`` long."""
-        if num_tokens <= 0:
-            return ""
-        assert self.tokenizer is not None
-        hf_tokenizer = self.tokenizer.get_tokenizer()
-        use_rng = rng if rng is not None else self.rng
-        token_ids = use_rng.integers(0, self.vocab_size, size=num_tokens).tolist()
-        return str(hf_tokenizer.decode(token_ids, skip_special_tokens=True))
+    Driven by ``load.type: trace_session_replay`` through
+    ``LoadGenerator.run_session_stage``: whole conversations arrive at
+    ``session_rate`` conversations/sec with ``concurrent_sessions: 0`` (unbounded =
+    true open loop). The load generator records a ``SessionLifecycleMetric`` per
+    conversation, so achieved sessions/s and session duration are measured natively.
+    Turn serialization is enforced by the graph runtime (turn k awaits turn k-1's
+    recorded output); simulated tool-call latency maps to ``GraphEvent.wait_ms``
+    (the runtime waits that long after the predecessor completes and before
+    dispatching the turn, so it lands in the session duration).
+    """
 
-    def _build_conversations(self) -> None:
-        """Pre-generate all conversation blueprints deterministically."""
-        cfg = self.cr_config
-        n = cfg.num_conversations
+    def __init__(
+        self,
+        api_config: APIConfig,
+        config: DataConfig,
+        tokenizer: Optional[CustomTokenizer],
+        mp_manager: Optional[SyncManager] = None,
+        base_seed: Optional[int] = None,
+        num_workers: int = 1,
+    ) -> None:
+        # replay_config=None: this is not a trace replay. All trace KV-replay
+        # features (output substitution, random-session-id injection, tool-call
+        # mitigation, wait-time capping) stay off, so requests are the synthetic
+        # messages we build, sent verbatim.
+        super().__init__(
+            api_config,
+            config,
+            tokenizer,
+            mp_manager=mp_manager,
+            base_seed=base_seed,
+            num_workers=num_workers,
+            replay_config=None,
+        )
+        self._init_generation(config)
+        self._build_conversations()
 
-        # Sample per-conversation parameters
-        if cfg.turns_per_conversation is not None:
-            turn_counts = self._sample_distribution(cfg.turns_per_conversation, n)
-        else:
-            turn_counts = [10] * n  # default fallback
+        if not self.blueprints:
+            raise ValueError("ConversationSessionGenerator produced no conversation blueprints.")
 
-        if cfg.dynamic_system_prompt_len is not None:
-            dynamic_lens = self._sample_distribution(cfg.dynamic_system_prompt_len, n)
-        else:
-            dynamic_lens = [0] * n
+        # One session slot per planned arrival across the whole run. run_session_stage
+        # advances a run-wide cursor and draws num_sessions distinct indices per stage,
+        # so the corpus must hold sum(num_sessions) slots. num_conversations is the total
+        # arrival count (auto-sized by the config validator when unset); slots recycle the
+        # blueprint pool by index % len(blueprints).
+        total_arrivals = self.cr_config.num_conversations
+        assert total_arrivals is not None, "num_conversations must be resolved before init"
+        session_ids = [f"conv_{i}" for i in range(total_arrivals)]
+        self.initialize_sessions_lazy(session_ids)
 
-        # Generate shared system prompt once (for stage 0)
-        shared_prompt_text = self._get_or_generate_shared_prompt(0)
-
-        total_turns = sum(turn_counts)
         logger.info(
-            "Building %d conversations (%d total turns, shared prompt %d tokens)",
-            n,
-            total_turns,
-            cfg.shared_system_prompt_len,
+            "ConversationSessionGenerator: %d blueprints, %d session slots (arrivals)",
+            len(self.blueprints),
+            total_arrivals,
         )
 
-        # Sample all turn-level parameters at once for efficiency
-        if cfg.input_tokens_per_turn is not None:
-            all_input_lens = self._sample_distribution(cfg.input_tokens_per_turn, total_turns)
-        else:
-            all_input_lens = [512] * total_turns
+    # -- SessionGenerator hook --------------------------------------------
 
-        if cfg.output_tokens_per_turn is not None:
-            all_output_lens = self._sample_distribution(cfg.output_tokens_per_turn, total_turns)
-        else:
-            all_output_lens = [256] * total_turns
+    def _build_session(self, session_index: int) -> Optional[ReplaySession]:
+        """Build one conversation's linear ReplayGraph on demand.
 
-        if cfg.tool_call_latency_sec is not None:
-            # Sample latencies as floats (seconds); re-use the same distribution
-            # machinery but convert from the integer output to float seconds.
-            all_tool_latencies: List[float] = [
-                float(v) for v in self._sample_distribution(cfg.tool_call_latency_sec, total_turns)
-            ]
-        else:
-            all_tool_latencies = []
+        Recycles the blueprint pool by ``index % len(blueprints)`` for content
+        variety across arrivals.
+        """
+        bp = self.blueprints[session_index % len(self.blueprints)]
+        session_id = self._session_ids[session_index]
+        graph = self._blueprint_to_graph(bp, session_id)
+        return ReplaySession(
+            session_id=session_id,
+            source_id="conversation_replay",
+            session_index=session_index,
+            graph=graph,
+        )
 
-        # Build each conversation
-        turn_offset = 0
-        for conv_id in range(n):
-            num_turns = turn_counts[conv_id]
+    def _blueprint_to_graph(self, bp: ConversationBlueprint, session_id: str) -> ReplayGraph:
+        """Map a conversation blueprint onto a linear ReplayGraph with a growing,
+        byte-stable conversation prefix (so vLLM's prefix cache is reused turn over
+        turn, which is what session-affinity / prefix-aware routing wins on).
 
-            # Two-part system prompt: shared prefix + dynamic suffix
-            dynamic_text = self._generate_random_token_text(dynamic_lens[conv_id])
-            system_prompt = self._build_system_prompt(shared_prompt_text, dynamic_text)
+        Turn k is one GraphEvent whose sole predecessor is turn k-1. The runtime
+        serialises turns (turn k awaits turn k-1's recorded output). Tool-call
+        latency maps to wait_ms.
 
-            # Generate turn prompts via batch decode
-            turn_input_lens = all_input_lens[turn_offset : turn_offset + num_turns]
-            turn_output_lens_list = all_output_lens[turn_offset : turn_offset + num_turns]
-            turn_tool_latencies = all_tool_latencies[turn_offset : turn_offset + num_turns] if all_tool_latencies else []
-            turn_offset += num_turns
+        Each turn resends the whole conversation so far, reconstructed from the
+        registry rather than rebuilt by this builder, so the leading bytes are
+        provably identical to what the predecessor put on the wire (== what vLLM
+        cached). We reference ONLY turn k-1 (O(1) per turn), because turn k-1's
+        recorded INPUT already chains the entire history (system + u0 + a0 + ... +
+        u_{k-1}); its recorded OUTPUT is a_{k-1}. So turn k's assembled input is:
 
-            # Batch generate token IDs then decode
-            turn_prompts: List[str] = []
-            for tlen in turn_input_lens:
-                turn_prompts.append(self._generate_random_token_text(tlen))
+            [ shared -> turn_{k-1}.input ]   # system + u0 + a0 + ... + u_{k-1}
+            [ output -> turn_{k-1}.output ]  # a_{k-1}, the tokens vLLM actually returned
+            [ unique  = u_k ]                # the only genuinely new content this turn
 
-            bp = ConversationBlueprint(
-                conversation_id=conv_id,
-                num_turns=num_turns,
-                system_prompt=system_prompt,
-                system_prompt_tokens=cfg.shared_system_prompt_len + dynamic_lens[conv_id],
-                dynamic_system_prompt=dynamic_text,
-                turn_prompts=turn_prompts,
-                turn_output_lens=turn_output_lens_list,
-                turn_tool_call_latencies=turn_tool_latencies,
+        i.e. turn k grows the prefix by exactly (a_{k-1} + u_k). The messages list
+        below is a builder-side FALLBACK copy (assistant slots are empty
+        placeholders); the wire truth comes from substitution in
+        _build_messages_with_substitution when the registry records exist. If a
+        record is missing (e.g. predecessor served on another worker), substitution
+        falls back to this recorded copy, so the graph stays well-formed.
+
+        Turn 0 is the root: no predecessor, no segments, sent verbatim (system? + u0).
+
+        The blueprint is already bounded to the context window at build time (see
+        ``_plan_within_budget``): ``num_turns`` is the effective (post-stop) turn count,
+        ``turn_output_lens`` are effective (post-clamp) outputs, and
+        ``turn_total_input_tokens[k]`` is the exact cumulative input for turn k. So this
+        method is pure assembly -- no budget checks, no tokenizer calls.
+        """
+        events: Dict[str, GraphEvent] = {}
+        prev_id: Optional[str] = None
+        prev_input_msg_count = 0
+        prev_input_messages: List[Dict[str, Any]] = []
+
+        def _in_len(idx: int) -> int:
+            return bp.turn_input_lens[idx] if idx < len(bp.turn_input_lens) else 0
+
+        for k in range(bp.num_turns):
+            event_id = f"turn_{k}"
+            user_msg = {"role": "user", "content": bp.turn_prompts[k]}
+            u_k_tokens = _in_len(k)
+            out_len = bp.turn_output_lens[k]
+            total_input_tokens = bp.turn_total_input_tokens[k]
+
+            messages: List[Dict[str, Any]]
+            segments: List[InputSegment]
+            if k == 0:
+                messages = []
+                if bp.system_prompt:
+                    messages.append({"role": "system", "content": bp.system_prompt})
+                messages.append(user_msg)
+                segments = []
+            else:
+                # Fallback copy: predecessor's full input + an assistant placeholder
+                # for a_{k-1} + the new user turn. Substitution overwrites the first
+                # two groups from the registry; the placeholder never reaches the
+                # wire un-substituted because turn k awaits turn k-1's completion.
+                a_prev_tokens = bp.turn_output_lens[k - 1]
+                assistant_ph = {"role": "assistant", "content": ""}
+                messages = list(prev_input_messages) + [assistant_ph, user_msg]
+                segments = [
+                    # system + u0 + a0 + ... + u_{k-1}, pulled from turn_{k-1}'s
+                    # recorded input (already chains all prior history -> O(1)).
+                    InputSegment(
+                        type="shared",
+                        message_count=prev_input_msg_count,
+                        token_count=bp.turn_total_input_tokens[k - 1],
+                        source_event_id=prev_id,
+                    ),
+                    # a_{k-1}: the real tokens vLLM returned, from turn_{k-1}'s output.
+                    # ignore_eos pins its length to the effective turn_output_lens[k-1].
+                    InputSegment(
+                        type="output",
+                        message_count=1,
+                        token_count=a_prev_tokens,
+                        source_event_id=prev_id,
+                    ),
+                    # u_k: the only new content this turn.
+                    InputSegment(type="unique", message_count=1, token_count=u_k_tokens),
+                ]
+
+            latency_sec = bp.turn_tool_call_latencies[k] if bp.turn_tool_call_latencies else 0.0
+            wait_ms = int(latency_sec * 1000)
+
+            call = GraphCall(
+                call_id=f"{session_id}:{event_id}",
+                model="",  # resolved from api_config by the client
+                messages=messages,
+                expected_output="",
+                input_segments=segments,
+                total_input_tokens=total_input_tokens,
+                expected_output_tokens=out_len,
+                temperature=None,
+                max_tokens_recorded=out_len,
+                tool_definitions=None,
+                expected_output_is_tool_call=False,
             )
-            self.blueprints.append(bp)
-
-            # Create a LocalUserSession with the system prompt as initial context
-            self.user_sessions.append(
-                self._new_session(
-                    user_session_id=f"conv_{conv_id}",
-                    context=system_prompt,
-                    system_prompt=system_prompt,
-                )
+            events[event_id] = GraphEvent(
+                event_id=event_id,
+                call=call,
+                predecessor_event_ids=[prev_id] if prev_id is not None else [],
+                predecessor_dependency_types={prev_id: "output"} if prev_id is not None else {},
+                wait_ms=wait_ms,
+                t_start_ms=0,
+                t_end_ms=0,
             )
+
+            prev_input_messages = messages
+            prev_input_msg_count = len(messages)
+            prev_id = event_id
+
+        return ReplayGraph(
+            events=events,
+            root_event_ids=["turn_0"],
+            source_file="conversation_replay",
+        )

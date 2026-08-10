@@ -71,6 +71,34 @@ class Config(StrictBaseModel):
                 )
         return self
 
+    @model_validator(mode="after")
+    def resolve_conversation_replay_num_conversations(self) -> "Config":
+        """Resolve num_conversations for conversation_replay.
+
+        Open-loop sessions/s (load.type 'trace_session_replay'): run_session_stage
+        advances a run-wide session cursor, so the blueprint corpus is sized to the
+        total arrivals across all stages. When num_conversations is unset, auto-size
+        it to sum(num_sessions) so every conversation in the run is a distinct
+        blueprint. Requires num_sessions on every stage in that case.
+        """
+        if self.data.type != DataGenType.ConversationReplay:
+            return self
+        cr = self.data.conversation_replay
+        if cr is None or cr.num_conversations is not None:
+            return self
+        if self.load.type == LoadType.TRACE_SESSION_REPLAY:
+            stages = [s for s in self.load.stages if isinstance(s, TraceSessionReplayLoadStage)]
+            if any(s.num_sessions is None for s in stages):
+                raise ValueError(
+                    "conversation_replay with load.type 'trace_session_replay' requires either "
+                    "conversation_replay.num_conversations set explicitly, or num_sessions on "
+                    "every stage (so the blueprint pool can auto-size to the total arrivals)."
+                )
+            cr.num_conversations = sum(int(s.num_sessions) for s in stages if s.num_sessions is not None)
+        else:
+            cr.num_conversations = 200
+        return self
+
 
 def deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
     result = base.copy()

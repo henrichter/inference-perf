@@ -443,3 +443,62 @@ def test_multimodal_config_parsing() -> None:
     finally:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
+
+
+def _cr_session_stage(session_rate: float, num_sessions: int) -> dict:
+    return {"concurrent_sessions": 0, "session_rate": session_rate, "num_sessions": num_sessions, "timeout": 60}
+
+
+def test_conversation_replay_trace_session_replay_auto_sizes_num_conversations() -> None:
+    # Open-loop: num_conversations auto-sizes to sum(num_sessions) across stages.
+    cfg = Config.model_validate(
+        {
+            "data": {"type": "conversation_replay", "conversation_replay": {"seed": 1}},
+            "api": {"type": "chat"},
+            "load": {
+                "type": "trace_session_replay",
+                "stages": [_cr_session_stage(0.5, 30), _cr_session_stage(1.0, 60)],
+            },
+        }
+    )
+    assert cfg.data.conversation_replay is not None
+    assert cfg.data.conversation_replay.num_conversations == 90
+
+
+def test_conversation_replay_trace_session_replay_requires_num_sessions() -> None:
+    with pytest.raises(ValueError, match="num_conversations"):
+        Config.model_validate(
+            {
+                "data": {"type": "conversation_replay", "conversation_replay": {"seed": 1}},
+                "api": {"type": "chat"},
+                "load": {
+                    "type": "trace_session_replay",
+                    "stages": [{"concurrent_sessions": 0, "session_rate": 0.5, "timeout": 60}],
+                },
+            }
+        )
+
+
+def test_conversation_replay_trace_session_replay_explicit_num_conversations_preserved() -> None:
+    cfg = Config.model_validate(
+        {
+            "data": {"type": "conversation_replay", "conversation_replay": {"num_conversations": 7}},
+            "api": {"type": "chat"},
+            "load": {"type": "trace_session_replay", "stages": [_cr_session_stage(1.0, 5)]},
+        }
+    )
+    assert cfg.data.conversation_replay is not None
+    assert cfg.data.conversation_replay.num_conversations == 7
+
+
+def test_conversation_replay_concurrent_defaults_num_conversations() -> None:
+    # Closed-loop concurrent path preserves the historical default of 200 when unset.
+    cfg = Config.model_validate(
+        {
+            "data": {"type": "conversation_replay", "conversation_replay": {"seed": 1}},
+            "api": {"type": "completion"},
+            "load": {"type": "concurrent", "stages": [{"num_requests": 40, "concurrency_level": 4}]},
+        }
+    )
+    assert cfg.data.conversation_replay is not None
+    assert cfg.data.conversation_replay.num_conversations == 200

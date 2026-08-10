@@ -74,7 +74,17 @@ class ConversationReplayConfig(StrictBaseModel):
     """
 
     seed: int = Field(42, description="Random seed for deterministic generation")
-    num_conversations: int = Field(200, gt=0, description="Number of conversation blueprints to generate")
+    num_conversations: Optional[int] = Field(
+        None,
+        gt=0,
+        description=(
+            "Number of distinct conversation blueprints (the content-variety pool). For "
+            "'concurrent' (closed-loop) this is the concurrency slot count; defaults to 200 "
+            "when unset. For 'trace_session_replay' (open-loop sessions/s) it is the blueprint "
+            "pool that arrivals recycle by index; when unset it auto-sizes to the total arrivals "
+            "(sum of num_sessions across stages) so every conversation in the run is distinct."
+        ),
+    )
     shared_system_prompt_len: int = Field(8359, ge=0, description="Fixed shared system prompt length in tokens")
     dynamic_system_prompt_len: Optional[Distribution] = Field(
         None, description="Per-conversation dynamic system prompt length distribution"
