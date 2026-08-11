@@ -612,11 +612,32 @@ class LoadGenerator:
                     progress_ctx.remove_task(stage_task)
                     stage_task = None
                 logger.warning(f"Stage {stage_id}: timeout after {timeout:.1f}s")
-                stage_status = StageStatus.FAILED
-                # Clean up any active session spans (using cached otel_instr)
-                for sid in list(session_spans.keys()):
-                    otel_instr.end_session_span(session_spans[sid], "Session timed out")
-                    del session_spans[sid]
+                # A timeout is the EXPECTED terminal condition of an open-loop
+                # saturation stage, not a failure: once arrivals stop the system
+                # only drains, so waiting for stragglers measures decreasing load.
+                # Mark the stage COMPLETED and record every still-in-flight session
+                # as an incomplete metric (partial num_events_completed => success
+                # is False downstream) so the count of sessions that did not drain
+                # is preserved as a saturation signal instead of being discarded.
+                stage_status = StageStatus.COMPLETED
+                timeout_epoch = time.time()
+                for session_idx in list(active_session_indices):
+                    session_info = self.datagen.get_session_info(session_idx)
+                    session_id = session_info["session_id"]
+                    if self.session_metrics_collector:
+                        session_metric = self.datagen.build_session_metric(
+                            session_id=session_id,
+                            stage_id=stage_id,
+                            start_time=session_dispatch_times.get(session_id, start_time_epoch),
+                            end_time=timeout_epoch,
+                        )
+                        self.session_metrics_collector.record_metric(session_metric)
+                    # Clean up active session spans (using cached otel_instr)
+                    if session_id in session_spans:
+                        otel_instr.end_session_span(session_spans[session_id], "Session timed out")
+                        del session_spans[session_id]
+                    self.datagen.cleanup_session(session_id)
+                active_session_indices.clear()
                 break
 
             # Check for completed sessions

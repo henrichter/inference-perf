@@ -259,5 +259,104 @@ class TestLoadGenerator(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.load_generator.interrupt_sig)
 
 
+class TestRunSessionStageTimeout(unittest.IsolatedAsyncioTestCase):
+    """A timeout is the expected terminal condition of an open-loop saturation
+    stage: the stage must report COMPLETED (not FAILED) and every session still
+    in-flight when the deadline fires must be recorded as an incomplete metric
+    (num_events_completed < num_events) so the count of sessions that failed to
+    drain is preserved as a saturation signal instead of being discarded."""
+
+    def _make_session_generator(self, completed_flags: dict[int, bool]) -> MagicMock:
+        """Fake SessionGenerator with len(completed_flags) sessions. A session
+        idx is treated as completed iff completed_flags[idx] is True; the rest
+        stay in-flight (as they would at a real timeout)."""
+        from inference_perf.datagen.base import SessionGenerator
+
+        gen = MagicMock(spec=SessionGenerator)
+        gen.get_session_count.return_value = len(completed_flags)
+        gen.get_session_info.side_effect = lambda idx: {"session_id": f"sess_{idx}", "source_id": ""}
+        gen.check_session_completed.side_effect = lambda sid: completed_flags[int(sid.split("_")[1])]
+        gen.get_session_events.return_value = []  # no events to enqueue in the unit harness
+        gen.get_session_state.return_value = MagicMock(failed=False)
+
+        def _build_metric(session_id: str, stage_id: int, start_time: float, end_time: float) -> Any:
+            idx = int(session_id.split("_")[1])
+            # Completed session: 2/2 events. In-flight session: 1/2 events.
+            completed = 2 if completed_flags[idx] else 1
+            return MagicMock(
+                session_id=session_id,
+                stage_id=stage_id,
+                num_events=2,
+                num_events_completed=completed,
+                start_time=start_time,
+                end_time=end_time,
+            )
+
+        gen.build_session_metric.side_effect = _build_metric
+        return gen
+
+    @patch("inference_perf.loadgen.load_generator.sleep", new_callable=AsyncMock)
+    @patch("inference_perf.loadgen.load_generator.time")
+    async def test_timeout_completes_and_records_inflight_sessions(
+        self, mock_time: MagicMock, mock_sleep: AsyncMock
+    ) -> None:
+        from inference_perf.client.server_metrics.base import StageStatus
+        from inference_perf.config import TraceSessionReplayLoadStage
+
+        # Session 0 completes on the first poll; session 1 never completes and is
+        # therefore still in-flight when the timeout fires.
+        gen = self._make_session_generator({0: True, 1: False})
+
+        # Wall-clock is constant; perf_counter starts at 0 then jumps past the
+        # 5s timeout on the next read so the timeout branch triggers immediately
+        # after both sessions have been dispatched and session 0 recorded.
+        mock_time.time.return_value = 1000.0
+        mock_time.perf_counter.side_effect = [0.0, 0.0, 0.0, 10.0] + [10.0] * 20
+
+        stage = TraceSessionReplayLoadStage(concurrent_sessions=0, session_rate=None, num_sessions=2, timeout=5.0)
+        load_config = LoadConfig(
+            type=LoadType.TRACE_SESSION_REPLAY,
+            num_workers=0,
+            stages=[stage],
+            circuit_breakers=[],
+        )
+        collector = MagicMock()
+        with patch("inference_perf.loadgen.load_generator.get_circuit_breaker"):
+            load_generator = LoadGenerator(gen, load_config, collector)
+
+        request_queue = MagicMock(spec=RequestQueue)
+        request_queue.drain = MagicMock()
+        active_counter = MagicMock()
+        active_counter.value = 0
+        finished_counter = MagicMock()
+        finished_counter.get_lock.return_value.__enter__ = MagicMock()
+        finished_counter.get_lock.return_value.__exit__ = MagicMock()
+        finished_counter.value = 0
+        request_phase = MagicMock()
+        cancel_signal = MagicMock()
+
+        await load_generator.run_session_stage(
+            stage_id=0,
+            stage=stage,
+            request_queue=request_queue,
+            active_requests_counter=active_counter,
+            finished_requests_counter=finished_counter,
+            request_phase=request_phase,
+            cancel_signal=cancel_signal,
+        )
+
+        # A timeout is a successful terminal condition, not a failure.
+        self.assertEqual(load_generator.stage_runtime_info[0].status, StageStatus.COMPLETED)
+
+        # Both sessions are recorded: the completed one AND the in-flight one.
+        recorded = [c.args[0] for c in collector.record_metric.call_args_list]
+        by_id = {m.session_id: m for m in recorded}
+        self.assertEqual(set(by_id), {"sess_0", "sess_1"})
+        # The completed session drained all its events...
+        self.assertEqual(by_id["sess_0"].num_events_completed, by_id["sess_0"].num_events)
+        # ...the in-flight session is recorded partial (the saturation signal).
+        self.assertLess(by_id["sess_1"].num_events_completed, by_id["sess_1"].num_events)
+
+
 if __name__ == "__main__":
     unittest.main()
