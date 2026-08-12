@@ -256,6 +256,9 @@ def main_cli() -> None:
     else:
         raise Exception("model server client config missing")
 
+    if hasattr(model_server_client, "retain_text"):
+        model_server_client.retain_text = bool(config.report.request_lifecycle.per_request)
+
     # Check load exists so datagen can derive total_count from the
     # stage configurations.
     if config.load is None:

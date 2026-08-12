@@ -579,7 +579,16 @@ def summarize_requests(
     valid_tpot = [v for v in tpot_values if v is not None]
     valid_ttft = [v for v in ttft_values if v is not None]
 
-    request_sizes = [len(x.request_data.encode("utf-8")) for x in all_successful]
+    request_sizes = [
+        x.request_size if x.request_size is not None else (len(x.request_data.encode("utf-8")) if x.request_data else 0)
+        for x in all_successful
+    ]
+    response_sizes = [
+        x.response_size
+        if x.response_size is not None
+        else (len(x.response_data.encode("utf-8")) if x.response_data else 0)
+        for x in all_successful
+    ]
     all_images = []
     all_videos = []
     all_audios = []
@@ -638,6 +647,7 @@ def summarize_requests(
             "audios_per_sec": (sum(audio_counts) / total_time if total_time > 0 else 0.0),
         },
         "request_size_bytes": summarize([float(x) for x in request_sizes], percentiles),
+        "response_size_bytes": summarize([float(x) for x in response_sizes], percentiles),
         "prompt_len": summarize(
             [safe_float(success.info.request_metrics.text.input_tokens) for success in all_successful], percentiles
         ),

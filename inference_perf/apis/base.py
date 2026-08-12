@@ -67,8 +67,10 @@ class RequestLifecycleMetric(BaseModel):
     scheduled_time: float
     start_time: float
     end_time: float
-    request_data: str
+    request_data: Optional[str] = None
     response_data: Optional[str] = None
+    request_size: Optional[int] = None
+    response_size: Optional[int] = None
     info: InferenceInfo
     error: Optional[ErrorResponseInfo]
 

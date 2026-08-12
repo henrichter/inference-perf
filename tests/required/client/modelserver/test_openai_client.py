@@ -381,3 +381,30 @@ async def test_process_request_success(mock_client: MagicMock, mock_data: MagicM
     assert metric.info == expected_info
     assert metric.response_data == "success_response_text"
     assert metric.error is None
+
+
+@pytest.mark.asyncio
+async def test_success_metric_drops_text_but_keeps_sizes(mock_client: MagicMock, mock_data: MagicMock) -> None:
+    """With retain_text off, a successful request drops the raw request/response text
+    (the unbounded-memory culprit) but still records their byte sizes."""
+    mock_client.retain_text = False
+    session = openAIModelServerClientSession(mock_client)
+    session.session = MagicMock()
+
+    mock_response = MagicMock()
+    mock_response.status = 200
+    mock_response.text = AsyncMock(return_value="success_response_text")
+    mock_data.process_response.return_value = InferenceInfo(request_metrics=RequestMetrics(text=Text(input_tokens=0)))
+
+    mock_post_ctx = MagicMock()
+    mock_post_ctx.__aenter__ = AsyncMock(return_value=mock_response)
+    mock_post_ctx.__aexit__ = AsyncMock(return_value=None)
+    session.session.post.return_value = mock_post_ctx
+
+    await session.process_request(mock_data, stage_id=1, scheduled_time=0.0)
+
+    metric = mock_client.metrics_collector.record_metric.call_args[0][0]
+    assert metric.request_data is None
+    assert metric.response_data is None
+    assert metric.request_size is not None and metric.request_size > 0
+    assert metric.response_size == len("success_response_text".encode("utf-8"))

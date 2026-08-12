@@ -103,6 +103,7 @@ class openAIModelServerClient(ModelServerClient):
         self.cert_path = cert_path
         self.key_path = key_path
         self.lora_config = lora_config
+        self.retain_text = False
 
         # Initialize OTEL instrumentation (configured via environment variables)
         self.otel = get_otel_instrumentation()
@@ -545,11 +546,21 @@ class openAIModelServerClientSession(ModelServerClientSession):
         if data.labels:
             info.labels = data.labels
 
+        request_size = len(request_data.encode("utf-8"))
+        response_size = len(response_content.encode("utf-8")) if response_content else 0
+        stored_request_data: Optional[str] = request_data
+        stored_response_data: Optional[str] = response_content
+        if not self.client.retain_text and error is None:
+            stored_request_data = None
+            stored_response_data = None
+
         metric = RequestLifecycleMetric(
             stage_id=stage_id,
             session_id=data.session_id if isinstance(data.session_id, str) else None,
-            request_data=request_data,
-            response_data=response_content,
+            request_data=stored_request_data,
+            response_data=stored_response_data,
+            request_size=request_size,
+            response_size=response_size,
             info=info,
             error=error,
             start_time=start,

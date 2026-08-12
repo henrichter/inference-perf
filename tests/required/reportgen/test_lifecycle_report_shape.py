@@ -52,6 +52,9 @@ def _mock_metric(
     m.ttft_slo_sec = None
     m.tpot_slo_sec = None
     m.request_data = request_data
+    m.response_data = None
+    m.request_size = None
+    m.response_size = None
     m.info = Mock(spec=InferenceInfo)
     m.info.request_metrics = RequestMetrics(
         text=Text(input_tokens=input_tokens),
@@ -219,6 +222,9 @@ def test_lifecycle_report_shape_with_failures() -> None:
     failure.ttft_slo_sec = None
     failure.tpot_slo_sec = None
     failure.request_data = "bad"
+    failure.response_data = None
+    failure.request_size = None
+    failure.response_size = None
     failure.info = Mock(spec=InferenceInfo)
     failure.info.request_metrics = RequestMetrics(text=Text(input_tokens=80))
     failure.info.response_metrics = None
