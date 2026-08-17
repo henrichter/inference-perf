@@ -640,10 +640,14 @@ class WekaTraceReplayDataGenerator(ReplayGraphSessionGeneratorBase):
         self._hash_id_rng = HashIdRandomGenerator(self.base_seed)
         self._cache: Dict[int, List[int]] = {}
 
-        # Load all WekaTrace records
+        # Load trace metadata (compact JSONL records); graph synthesis is deferred
+        # to _build_session so text is never held in memory for the whole dataset.
         traces = self._load_weka_traces()
-        sessions = self._build_sessions_from_traces(traces)
-        self.initialize_sessions(sessions)
+        random.seed(self.base_seed)
+        random.shuffle(traces)
+        self._traces = traces
+        session_ids = [f"wekatrace{i}_{t.id}" for i, t in enumerate(traces)]
+        self.initialize_sessions_lazy(session_ids)
 
     def _load_weka_traces(self) -> List[WekaTrace]:
         """Loads traces from directories, files, or Hugging Face dataset."""
@@ -713,36 +717,24 @@ class WekaTraceReplayDataGenerator(ReplayGraphSessionGeneratorBase):
 
         return list(unique_traces.values())
 
-    def _build_sessions_from_traces(self, traces: List[WekaTrace]) -> List[ReplaySession]:
-        sessions: List[ReplaySession] = []
-
-        for trace_index, trace in enumerate(traces):
-            try:
-                raw_calls = self._reconstruct_raw_calls(trace)
-                if not raw_calls:
-                    continue
-
-                graph = build_graph(raw_calls, source_file=f"weka_trace_{trace.id}")
-
-                # Make session ID unique per trace run
-                session_id = f"wekatrace{trace_index}_{trace.id}"
-                sessions.append(
-                    ReplaySession(
-                        session_id=session_id,
-                        source_id=trace.id,
-                        session_index=trace_index,
-                        graph=graph,
-                    )
-                )
-            except Exception as e:
-                logger.error(f"Failed to process Weka trace {trace.id}: {e}")
-                if not self.weka_config.skip_invalid_files:
-                    raise
-
-        # Shuffle sessions for stress testing
-        random.seed(self.base_seed)
-        random.shuffle(sessions)
-        return sessions
+    def _build_session(self, session_index: int) -> Optional[ReplaySession]:
+        trace = self._traces[session_index]
+        try:
+            raw_calls = self._reconstruct_raw_calls(trace)
+            if not raw_calls:
+                return None
+            graph = build_graph(raw_calls, source_file=f"weka_trace_{trace.id}")
+            return ReplaySession(
+                session_id=self._session_ids[session_index],
+                source_id=trace.id,
+                session_index=session_index,
+                graph=graph,
+            )
+        except Exception as e:
+            logger.error(f"Failed to process Weka trace {trace.id}: {e}")
+            if not self.weka_config.skip_invalid_files:
+                raise
+            return None
 
     def _reconstruct_raw_calls(self, trace: WekaTrace) -> List[RawCall]:
         # Reset local cache for deterministic scope
