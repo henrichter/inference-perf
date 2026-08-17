@@ -695,7 +695,7 @@ class WekaTraceReplayDataGenerator(ReplayGraphSessionGeneratorBase):
 
                 with open(local_path, "r", encoding="utf-8") as file_stream:
                     for line_idx, line in enumerate(file_stream):
-                        if line_idx >= self.weka_config.num_dataset_entries:
+                        if 0 < self.weka_config.num_dataset_entries <= line_idx:
                             break
                         if line.strip():
                             try:
@@ -1000,6 +1000,6 @@ class WekaTraceReplayDataGenerator(ReplayGraphSessionGeneratorBase):
     def _build_model_map(self, trace: WekaTrace) -> Dict[str, str]:
         """Maps trace-side models to configured api_config or target models."""
         configured = self.weka_config.model_mapping or {}
-        if self.weka_config.use_static_model:
+        if self.weka_config.static_model_name:
             return {m: self.weka_config.static_model_name for m in trace.models}
         return configured

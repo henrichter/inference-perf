@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import math
 import time
 from enum import Enum
 from os import cpu_count
@@ -87,7 +88,7 @@ class TraceSessionReplayLoadStage(LoadStage):
 
     # Session concurrency control (REQUIRED)
     concurrent_sessions: int = Field(
-        ...,  # Required field
+        0,
         ge=0,
         description=(
             "Maximum number of sessions active simultaneously. "
@@ -102,13 +103,13 @@ class TraceSessionReplayLoadStage(LoadStage):
         gt=0,
         description="Sessions to start per second (optional, omit for no rate limit)",
     )
-    num_sessions: Optional[int] = Field(
-        None,
-        gt=0,
+    num_sessions: int = Field(
+        0,
+        ge=0,
         description=(
             "Number of sessions to run in this stage. "
             "Draws the next N sessions from the corpus. "
-            "None = all remaining sessions."
+            "0 = all remaining sessions."
         ),
     )
     timeout: Optional[float] = Field(
@@ -132,6 +133,9 @@ class TraceSessionReplayLoadStage(LoadStage):
                     f"concurrent_sessions ({self.concurrent_sessions}). "
                     f"You can't start sessions faster than the concurrency limit allows."
                 )
+
+        if self.concurrent_sessions == 0 and self.num_sessions == 0 and self.session_rate is not None and self.timeout is not None:
+            self.num_sessions = math.ceil(self.session_rate * self.timeout)
 
         return self
 

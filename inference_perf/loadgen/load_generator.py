@@ -439,7 +439,7 @@ class LoadGenerator:
             logger.warning(f"Stage {stage_id}: no sessions remaining in trace files, skipping")
             return
         effective_num_sessions = (
-            min(stage.num_sessions, available_sessions) if stage.num_sessions is not None else available_sessions
+            min(stage.num_sessions, available_sessions) if stage.num_sessions > 0 else available_sessions
         )
 
         stage_start_cursor = self._session_cursor
@@ -992,10 +992,10 @@ class LoadGenerator:
                 total_requested = sum(
                     s.num_sessions
                     for s in self.stages
-                    if isinstance(s, TraceSessionReplayLoadStage) and s.num_sessions is not None
+                    if isinstance(s, TraceSessionReplayLoadStage) and s.num_sessions > 0
                 )
                 has_open_ended = any(
-                    isinstance(s, TraceSessionReplayLoadStage) and s.num_sessions is None for s in self.stages
+                    isinstance(s, TraceSessionReplayLoadStage) and s.num_sessions == 0 for s in self.stages
                 )
                 if not has_open_ended and total_requested > total_sessions:
                     raise ValueError(

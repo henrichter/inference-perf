@@ -69,6 +69,16 @@ class Config(StrictBaseModel):
                     f"but got '{self.load.type.value}'. Trace replay with dependencies requires "
                     f"session-based load dispatch to properly handle event dependencies and timing."
                 )
+
+        weka_cfg = self.data.weka_trace_replay
+        if weka_cfg is not None:
+            stages = [s for s in self.load.stages if isinstance(s, TraceSessionReplayLoadStage)]
+            total_requested = sum(s.num_sessions for s in stages if s.num_sessions > 0)
+            if weka_cfg.num_dataset_entries == 0 and total_requested > 0 and all(s.num_sessions > 0 for s in stages):
+                weka_cfg.num_dataset_entries = total_requested
+            if total_requested > 0 and weka_cfg.duplicate_sessions_target is None:
+                weka_cfg.duplicate_sessions_target = total_requested
+
         return self
 
 

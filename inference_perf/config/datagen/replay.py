@@ -102,14 +102,12 @@ class SessionReplayConfig(StrictBaseModel):
     """Base configuration for session replay data generators."""
 
     # Model configuration
-    use_static_model: bool = Field(False, description="Use a single static model for all requests")
-    static_model_name: str = Field("", description="Static model name (required if use_static_model=True)")
+    static_model_name: str = Field("", description="Static model name to use for all requests. Empty = use model_mapping or trace-recorded model names.")
     model_mapping: Optional[Dict[str, str]] = Field(None, description="Map recorded model names to target models")
 
     # Request configuration
-    default_max_tokens: int = Field(1000, gt=0, description="Default max_tokens if not specified in trace")
     override_tool_call_max_tokens: bool = Field(
-        True,
+        False,
         description="Override tool call max_tokens to 4096 instead of using trace recorded length",
     )
 
@@ -127,12 +125,12 @@ class SessionReplayConfig(StrictBaseModel):
 
     # Timing
     max_wait_ms: int = Field(
-        15000,
+        0,
         ge=0,
         description="Maximum inter-event wait time in milliseconds. Caps the delay between predecessor completion and event dispatch to avoid reproducing unusually long tool/agent execution times from the original trace.",
     )
     predecessor_wait_timeout_sec: float = Field(
-        3600.0,
+        0,
         ge=0,
         description=(
             "Seconds to wait for predecessor events to complete before failing. "
@@ -145,14 +143,6 @@ class SessionReplayConfig(StrictBaseModel):
     include_errors: bool = Field(True, description="Include spans with error status")
     skip_invalid_files: bool = Field(False, description="Skip invalid trace files instead of failing")
 
-    @model_validator(mode="after")
-    def validate_static_model(self) -> "SessionReplayConfig":
-        # Validate static model configuration
-        if self.use_static_model and not self.static_model_name:
-            raise ValueError("static_model_name is required when use_static_model=True")
-        if not self.use_static_model and self.static_model_name and not self.model_mapping:
-            raise ValueError("Either use_static_model must be True or model_mapping must be provided")
-        return self
 
 
 class OTelTraceReplayConfig(SessionReplayConfig):
@@ -273,7 +263,7 @@ class WekaTraceReplayConfig(SessionReplayConfig):
     ignore_trace_delays: bool = Field(False, description="Ignore delays/delays from original trace and run back-to-back")
     use_think_time_only: bool = Field(False, description="Only use think_time attribute instead of timestamps")
     default_block_size: int = Field(64, description="Default block size if not specified in trace")
-    num_dataset_entries: int = Field(100, description="Max number of dataset traces to load from HuggingFace")
+    num_dataset_entries: int = Field(0, description="Max number of dataset traces to load from HuggingFace. 0 = auto (sum of num_sessions across stages, set at config validation time).")
 
     @model_validator(mode="after")
     def validate_trace_sources(self) -> "WekaTraceReplayConfig":
